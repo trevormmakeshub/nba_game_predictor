@@ -23,5 +23,5 @@ Baseline holdout: accuracy 0.6702, total MAE 21.650, prior-points blend MAE 17.5
 Recent-form holdout: accuracy 0.6755, total MAE 21.536, prior-points blend MAE 17.462, 188 test games after 1299 earlier games
 Recent form adopted: yes
 Points blend adopted: yes
-Current-season team rows: 30. The team file is wins and points from the completed 2026 regular-season games. Box-score counting stats were left out because stats.nba.com did not return a new game log.
-Player rows: 250
+Current-season team rows: 30. Counting stats sum the saved team log and 56 later ESPN box scores. Each box score's points match the completed file. oreb, dreb, reb, ast, stl, blk, tov, and pf are per game. Shot makes are season totals.
+Player rows: 321

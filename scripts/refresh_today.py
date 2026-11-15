@@ -85,7 +85,9 @@ FINDER_URL = "https://stats.nba.com/stats/leaguegamefinder"
 PLAYER_NBA_URL = "https://stats.nba.com/stats/leaguedashplayerstats"
 TEAMS_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams?limit=50"
 SCHEDULE_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/schedule?season={season}"
-PLAYER_ESPN_URL = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete?limit=250&season=2027&seasontype=2"
+PLAYER_ESPN_URL = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete?limit=1000&season=2027&seasontype=2"
+SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
+SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={event_id}"
 NBA_FROM_ESPN = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
 SLICES = (
     ("2025-26", "Regular Season"),
@@ -611,6 +613,24 @@ def calibration_rows(rows: list[dict], split: str) -> list[dict]:
     return out
 
 
+PER_GAME_COUNTS = ("oreb", "dreb", "reb", "ast", "stl", "blk", "tov", "pf")
+BOX_PAIRS = {
+    "fgm": "fieldGoalsMade-fieldGoalsAttempted",
+    "fg3m": "threePointFieldGoalsMade-threePointFieldGoalsAttempted",
+    "ftm": "freeThrowsMade-freeThrowsAttempted",
+}
+BOX_SINGLES = {
+    "oreb": "offensiveRebounds",
+    "dreb": "defensiveRebounds",
+    "reb": "totalRebounds",
+    "ast": "assists",
+    "stl": "steals",
+    "blk": "blocks",
+    "tov": "turnovers",
+    "pf": "fouls",
+}
+
+
 def team_snapshot(completed: list[dict]) -> pd.DataFrame:
     """Wins and points from completed 2026 regular-season games."""
     totals: dict[str, dict] = {}
@@ -635,6 +655,148 @@ def team_snapshot(completed: list[dict]) -> pd.DataFrame:
     frame["ppg"] = frame["points_for"] / frame["games"]
     frame["papg"] = frame["points_against"] / frame["games"]
     return frame.sort_values("team")
+
+
+def made_attempted(text: str) -> tuple[float, float]:
+    made, attempted = str(text).split("-", 1)
+    return float(made), float(attempted)
+
+
+def box_team_counts(event_id: str) -> dict[str, dict]:
+    payload = fetch_json(SUMMARY_URL.format(event_id=event_id))
+    competition = payload["header"]["competitions"][0]
+    scores = {}
+    for side in competition.get("competitors") or []:
+        abbrev = official_abbrev(side["team"].get("abbreviation") or "")
+        scores[abbrev] = score_value(side.get("score"))
+    counts = {}
+    for team in payload["boxscore"]["teams"]:
+        abbrev = official_abbrev(team["team"].get("abbreviation") or "")
+        stats = {item.get("name"): item.get("displayValue") for item in team.get("statistics") or []}
+        record = {"pts": scores.get(abbrev)}
+        for column, name in BOX_PAIRS.items():
+            made, attempted = made_attempted(stats[name])
+            record[column] = made
+            record[column.replace("m", "a")] = attempted
+        for column, name in BOX_SINGLES.items():
+            record[column] = float(stats[name])
+        counts[abbrev] = record
+    return counts
+
+
+def write_team_counting(completed: list[dict]) -> tuple[pd.DataFrame, str]:
+    """Log counting stats plus an ESPN box score for each later final."""
+    snapshot = team_snapshot(completed)
+    if snapshot.empty:
+        snapshot.to_csv(TEAM_STATS_PATH, index=False)
+        return snapshot, "The team file is empty."
+    log = pd.read_csv(LOG_PATH)
+    log["GAME_DATE"] = log["GAME_DATE"].astype(str).str.slice(0, 10)
+    known = {(row["date"], row["away"], row["home"]) for row in games_from_log(log)}
+    current = log[(log["season"] == 2026) & (log["game_type"] == "REG")]
+    buckets: dict[str, dict] = {}
+    for team, group in current.groupby("TEAM_ABBREVIATION"):
+        buckets[str(team)] = {column.lower(): float(group[column].sum()) for column in COUNT_COLUMNS}
+        buckets[str(team)]["box_games"] = 0
+    gap = [
+        row for row in completed
+        if int(row.get("season") or 0) == 2026
+        and row.get("game_type") == "REG"
+        and (str(row["date"]), row["away"], row["home"]) not in known
+    ]
+    events: dict[tuple[str, str, str], str] = {}
+    for day in sorted({str(row["date"]) for row in gap}):
+        payload = fetch_json(SCOREBOARD_URL.format(ymd=day.replace("-", "")))
+        for event in payload.get("events") or []:
+            competition = event["competitions"][0]
+            if competition.get("status", {}).get("type", {}).get("name") != "STATUS_FINAL":
+                continue
+            stamp = datetime.fromisoformat(event["date"].replace("Z", "+00:00")).astimezone(EASTERN)
+            home = next(side for side in competition["competitors"] if side.get("homeAway") == "home")
+            away = next(side for side in competition["competitors"] if side.get("homeAway") == "away")
+            key = (
+                stamp.date().isoformat(),
+                official_abbrev(away["team"].get("abbreviation") or ""),
+                official_abbrev(home["team"].get("abbreviation") or ""),
+            )
+            events[key] = str(event["id"])
+    missing = [row for row in gap if (str(row["date"]), row["away"], row["home"]) not in events]
+    boxes: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(box_team_counts, event_id): event_id for event_id in set(events.values())}
+        for future in as_completed(futures):
+            boxes[futures[future]] = future.result()
+    rejected = []
+    for row in gap:
+        key = (str(row["date"]), row["away"], row["home"])
+        event_id = events.get(key)
+        box = None if event_id is None else boxes.get(event_id)
+        if box is None or row["away"] not in box or row["home"] not in box:
+            rejected.append(f"{key[0]} {key[1]} at {key[2]}")
+            continue
+        for side in ("away", "home"):
+            record = box[row[side]]
+            if int(record["pts"]) != int(row[f"{side}_score"]):
+                rejected.append(f"{key[0]} {row[side]} points {record['pts']} vs {row[f'{side}_score']}")
+                break
+        else:
+            for side in ("away", "home"):
+                bucket = buckets.setdefault(row[side], {column.lower(): 0.0 for column in COUNT_COLUMNS} | {"box_games": 0})
+                for column in COUNT_COLUMNS:
+                    bucket[column.lower()] += float(record_value(box[row[side]], column.lower()))
+                bucket["box_games"] += 1
+    if missing or rejected:
+        snapshot.to_csv(TEAM_STATS_PATH, index=False)
+        note = (
+            "Team counting stats were not written. "
+            f"Missing ESPN events: {len(missing)}. Rejected box scores: {len(rejected)}."
+        )
+        print(note)
+        for item in (rejected + [f"missing {row['date']} {row['away']} at {row['home']}" for row in missing])[:8]:
+            print(item)
+        return snapshot, note
+    frame = snapshot.copy()
+    for column in [name.lower() for name in COUNT_COLUMNS if name != "PTS"]:
+        frame[column] = frame["team"].map(lambda team, column=column: buckets[team][column])
+    mismatches = []
+    for row in frame.itertuples(index=False):
+        bucket = buckets.get(row.team)
+        if bucket is None or int(bucket["pts"]) != int(row.points_for):
+            mismatches.append(row.team)
+    if mismatches:
+        snapshot.to_csv(TEAM_STATS_PATH, index=False)
+        note = "Team counting stats were not written. Box-score points differ for " + ", ".join(mismatches) + "."
+        print(note)
+        return snapshot, note
+    for column in PER_GAME_COUNTS:
+        frame[column] = frame[column] / frame["games"]
+    frame["fg_pct"] = frame["fgm"] / frame["fga"]
+    frame["fg3_pct"] = frame["fg3m"] / frame["fg3a"]
+    frame["ft_pct"] = frame["ftm"] / frame["fta"]
+    order = [
+        "team", "games", "wins", "losses", "points_for", "points_against", "ppg", "papg",
+        "fgm", "fga", "fg_pct", "fg3m", "fg3a", "fg3_pct", "ftm", "fta", "ft_pct",
+        "oreb", "dreb", "reb", "ast", "stl", "blk", "tov", "pf",
+    ]
+    output = frame[order].sort_values("team")
+    output.to_csv(TEAM_STATS_PATH, index=False)
+    note = (
+        f"Counting stats sum the saved team log and {len(gap)} later ESPN box scores. "
+        "Each box score's points match the completed file. "
+        "oreb, dreb, reb, ast, stl, blk, tov, and pf are per game. Shot makes are season totals."
+    )
+    print(f"team counting rows {len(output)} gap games {len(gap)}")
+    return output, note
+
+
+def record_value(box: dict, column: str) -> float:
+    if column == "fga":
+        return box["fga"]
+    if column == "fg3a":
+        return box["fg3a"]
+    if column == "fta":
+        return box["fta"]
+    return box[column]
 
 
 def season_team_stats(log: pd.DataFrame) -> pd.DataFrame:
@@ -835,8 +997,7 @@ def main() -> None:
     train_rows = score_rows(completed, upcoming, model_report["use_blend"])
     hold_train, hold_test, accuracy = holdout_accuracy(completed)
     player_rows, player_note = pull_player_stats()
-    team_stats = team_snapshot(completed)
-    team_stats.to_csv(TEAM_STATS_PATH, index=False)
+    team_stats, team_note = write_team_counting(completed)
 
     for row in completed + upcoming:
         row["game_id"] = f"{row['date']}_{row['away']}_{row['home']}"
@@ -983,7 +1144,7 @@ def main() -> None:
         f"{card_line('Recent-form holdout', model_report.get('recent'))}\n"
         f"Recent form adopted: {'yes' if model_report['adopted_recent'] else 'no'}\n"
         f"Points blend adopted: {'yes' if model_report['use_blend'] else 'no'}\n"
-        f"Current-season team rows: {len(team_stats)}\n"
+        f"Current-season team rows: {len(team_stats)}. {team_note}\n"
         f"Player rows: {player_rows}\n",
         encoding="utf-8",
         newline="\n",
