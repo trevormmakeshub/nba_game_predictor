@@ -1,4 +1,4 @@
-"""Pull NBA results and retrain the prior-form table through 2026-11-07.
+"""Pull NBA results and retrain the prior-form table through 2026-11-14.
 
 Completed scores come from stats.nba.com leaguegamefinder. ESPN team
 schedules supply the upcoming schedule and venues. A postponed ESPN game
@@ -9,6 +9,7 @@ is not a feature. This does not price a bet.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,8 +66,8 @@ except ImportError:
             return samples @ self.coef_ + self.intercept_
 
 
-AS_OF = date(2026, 11, 7)
-NEXT_THROUGH = date(2026, 11, 14)
+AS_OF = date(2026, 11, 14)
+NEXT_THROUGH = date(2026, 11, 21)
 HOLDOUT_START = date(2026, 10, 20)
 EASTERN = ZoneInfo("America/New_York")
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,7 +102,15 @@ FEATURES = [
     "home_rest_days",
     "away_rest_days",
 ]
+RECENT_FEATURES = [
+    "home_recent_win_rate",
+    "away_recent_win_rate",
+    "home_recent_margin",
+    "away_recent_margin",
+]
 COUNT_COLUMNS = ["FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "OREB", "DREB", "REB", "AST", "STL", "BLK", "TOV", "PF", "PTS"]
+CALIBRATION_PATH = ROOT / "artifacts" / "calibration.csv"
+HIGH_PATH = ROOT / "artifacts" / "high_confidence.csv"
 LINE = "not a bet"
 NBA_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -113,13 +122,23 @@ NBA_HEADERS = {
 }
 
 
-def fetch_json(url: str, timeout: int = 60, headers: dict | None = None) -> dict:
+def fetch_json(url: str, timeout: int = 20, headers: dict | None = None, attempts: int = 2) -> dict:
     request = urllib.request.Request(
         url,
         headers=headers or {"User-Agent": "nba-game-predictor/1.0", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            last_error = exc
+            print(f"retry {attempt + 1} {type(exc).__name__}", flush=True)
+            time.sleep(2 * (attempt + 1))
+    if last_error is None:
+        raise RuntimeError(url)
+    raise last_error
 
 
 def official_abbrev(code: str) -> str:
@@ -147,7 +166,7 @@ def load_logs() -> tuple[pd.DataFrame, list[str]]:
     for season, season_type in SLICES:
         try:
             frame = league_games(season, season_type)
-        except (urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             notes.append(f"{season} {season_type} failed ({type(exc).__name__})")
             print(notes[-1])
             continue
@@ -352,15 +371,20 @@ def add_prior_form(rows: list[dict]) -> None:
         for side in ("home", "away"):
             games = history.get(row[side], [])
             if games:
+                window = games[-4:]
                 row[f"{side}_win_rate"] = sum(item[3] for item in games) / len(games)
                 row[f"{side}_ppg"] = sum(item[1] for item in games) / len(games)
                 row[f"{side}_papg"] = sum(item[2] for item in games) / len(games)
                 row[f"{side}_rest_days"] = (date.fromisoformat(row["date"]) - games[-1][0]).days
+                row[f"{side}_recent_win_rate"] = sum(item[3] for item in window) / len(window)
+                row[f"{side}_recent_margin"] = sum(item[1] - item[2] for item in window) / len(window)
             else:
                 row[f"{side}_win_rate"] = None
                 row[f"{side}_ppg"] = None
                 row[f"{side}_papg"] = None
                 row[f"{side}_rest_days"] = None
+                row[f"{side}_recent_win_rate"] = None
+                row[f"{side}_recent_margin"] = None
         if not row["played"]:
             continue
         home_win = int(row["home_score"] > row["away_score"])
@@ -373,19 +397,21 @@ def add_prior_form(rows: list[dict]) -> None:
         )
 
 
-def win_probability(row: dict, center, scale, ridge, positive_is_home: bool) -> float | None:
-    if any(row.get(feature) is None for feature in FEATURES):
+def win_probability(row: dict, center, scale, ridge, positive_is_home: bool, features: list[str] | None = None) -> float | None:
+    features = FEATURES if features is None else features
+    if any(row.get(feature) is None for feature in features):
         return None
-    sample = (np.array([row[feature] for feature in FEATURES], dtype=float) - center) / scale
+    sample = (np.array([row[feature] for feature in features], dtype=float) - center) / scale
     decision = float(ridge.decision_function(sample.reshape(1, -1))[0])
     if not positive_is_home:
         decision = -decision
     return float(expit(decision))
 
 
-def fit_model(rows: list[dict]):
+def fit_model(rows: list[dict], features: list[str] | None = None):
+    features = FEATURES if features is None else features
     frame = pd.DataFrame(rows)
-    matrix = frame[FEATURES].to_numpy(dtype=float)
+    matrix = frame[features].to_numpy(dtype=float)
     center = matrix.mean(axis=0)
     scale = matrix.std(axis=0)
     scale[scale == 0] = 1.0
@@ -418,7 +444,7 @@ def holdout_accuracy(completed: list[dict]) -> tuple[int, int, float | None]:
     return len(train_rows), len(test_rows), correct / len(test_rows)
 
 
-def score_rows(completed: list[dict], upcoming: list[dict]) -> int:
+def score_rows(completed: list[dict], upcoming: list[dict], use_blend: bool = False) -> int:
     trainable = [
         row for row in completed
         if row.get("home_win") is not None and all(row.get(feature) is not None for feature in FEATURES)
@@ -432,12 +458,183 @@ def score_rows(completed: list[dict], upcoming: list[dict]) -> int:
         probability = win_probability(row, center, scale, ridge, positive_is_home)
         row["home_win_prob"] = probability
         if probability is None:
+            annotate_prediction(row)
             continue
         sample = ((np.array([row[feature] for feature in FEATURES], dtype=float) - center) / scale).reshape(1, -1)
-        row["predicted_away_points"] = float(away_points.predict(sample)[0])
-        row["predicted_home_points"] = float(home_points.predict(sample)[0])
-        row["predicted_points"] = row["predicted_away_points"] + row["predicted_home_points"]
+        home = float(home_points.predict(sample)[0])
+        away = float(away_points.predict(sample)[0])
+        if use_blend and row.get("home_ppg") is not None and row.get("away_ppg") is not None:
+            regression_total = home + away
+            blended_total = 0.5 * regression_total + 0.5 * (float(row["home_ppg"]) + float(row["away_ppg"]))
+            margin = home - away
+            home = (blended_total + margin) / 2
+            away = (blended_total - margin) / 2
+        row["predicted_home_points"] = home
+        row["predicted_away_points"] = away
+        row["predicted_points"] = home + away
+        annotate_prediction(row)
     return len(trainable)
+
+
+def annotate_prediction(row: dict) -> None:
+    home_points = row.get("predicted_home_points")
+    away_points = row.get("predicted_away_points")
+    if home_points is not None and away_points is not None:
+        row["predicted_total"] = float(home_points) + float(away_points)
+    else:
+        row["predicted_total"] = row.get("predicted_points")
+    probability = row.get("home_win_prob")
+    if probability is None:
+        row["pick_side"] = None
+        row["pick_team"] = None
+        row["confidence"] = None
+        row["confidence_tier"] = None
+        return
+    probability = float(probability)
+    if probability >= 0.5:
+        row["pick_side"] = "home"
+        row["pick_team"] = row.get("home")
+    else:
+        row["pick_side"] = "away"
+        row["pick_team"] = row.get("away")
+    row["confidence"] = abs(probability - 0.5)
+    if probability >= 0.60 or probability <= 0.40:
+        row["confidence_tier"] = "high"
+    elif probability >= 0.55 or probability <= 0.45:
+        row["confidence_tier"] = "medium"
+    else:
+        row["confidence_tier"] = "low"
+
+
+def feature_metrics(rows: list[dict], features: list[str], required: list[str]) -> dict | None:
+    def ready(start: date | None, end: date | None) -> list[dict]:
+        chosen = []
+        for row in rows:
+            if row.get("home_win") is None or any(row.get(name) is None for name in required):
+                continue
+            game_date = date.fromisoformat(row["date"])
+            if start is not None and game_date < start:
+                continue
+            if end is not None and game_date >= end:
+                continue
+            chosen.append(row)
+        return chosen
+
+    train_rows = ready(None, HOLDOUT_START)
+    test_rows = ready(HOLDOUT_START, None)
+    if len(train_rows) < 2 or not test_rows or len({row["home_win"] for row in train_rows}) < 2:
+        return None
+    center, scale, ridge, home_points, away_points, positive_is_home = fit_model(train_rows, features)
+    correct = 0
+    total_error = 0.0
+    blend_error = 0.0
+    pairs = []
+    for row in test_rows:
+        probability = win_probability(row, center, scale, ridge, positive_is_home, features)
+        if probability is None:
+            continue
+        sample = ((np.array([row[name] for name in features], dtype=float) - center) / scale).reshape(1, -1)
+        home = float(home_points.predict(sample)[0])
+        away = float(away_points.predict(sample)[0])
+        actual = float(row["home_score"]) + float(row["away_score"])
+        total_error += abs((home + away) - actual)
+        blend_error += abs((0.5 * (home + away) + 0.5 * (float(row["home_ppg"]) + float(row["away_ppg"]))) - actual)
+        correct += int(int(probability >= 0.5) == int(row["home_win"]))
+        pairs.append({"home_win": int(row["home_win"]), "home_win_prob": probability})
+    counted = len(pairs)
+    if counted == 0:
+        return None
+    return {
+        "train_rows": len(train_rows),
+        "test_rows": counted,
+        "accuracy": correct / counted,
+        "total_mae": total_error / counted,
+        "blend_mae": blend_error / counted,
+        "pairs": pairs,
+    }
+
+
+def choose_model(completed: list[dict]) -> dict:
+    """Keep recent form only when the holdout does not get worse and no extra rows go blank."""
+    global FEATURES
+    base = [name for name in FEATURES if name not in RECENT_FEATURES]
+    expanded = base + RECENT_FEATURES
+
+    def countable(features: list[str]) -> int:
+        return sum(
+            row.get("home_win") is not None and all(row.get(name) is not None for name in features)
+            for row in completed
+        )
+
+    baseline = feature_metrics(completed, base, expanded)
+    candidate = feature_metrics(completed, expanded, expanded)
+    adopted = False
+    if baseline is not None and candidate is not None and countable(expanded) == countable(base):
+        if candidate["accuracy"] + 1e-12 >= baseline["accuracy"] and candidate["total_mae"] <= baseline["total_mae"] + 0.5:
+            adopted = True
+    FEATURES = expanded if adopted else base
+    active = candidate if adopted else baseline
+    return {
+        "baseline": baseline,
+        "recent": candidate,
+        "adopted_recent": adopted,
+        "use_blend": active is not None and active["blend_mae"] + 0.05 < active["total_mae"],
+        "chosen": active,
+    }
+
+
+def calibration_rows(rows: list[dict], split: str) -> list[dict]:
+    bins = (("50-55", 0.50, 0.55), ("55-60", 0.55, 0.60), ("60-65", 0.60, 0.65), ("65-plus", 0.65, 1.01))
+    out = []
+    for name, low, high in bins:
+        group = [
+            row for row in rows
+            if row.get("home_win") is not None
+            and row.get("home_win_prob") is not None
+            and low <= float(row["home_win_prob"]) < high
+        ]
+        count = len(group)
+        if count == 0:
+            rate = None
+            calibrated = "no"
+            note = "no rows"
+        else:
+            rate = sum(int(row["home_win"]) for row in group) / count
+            calibrated = "yes" if count >= 20 and rate >= low else "no"
+            if count < 20:
+                note = "count under 20"
+            elif rate >= low:
+                note = "observed home-win rate is at least the bin floor"
+            else:
+                note = "observed home-win rate is below the bin floor"
+        out.append({"split": split, "bin": name, "count": count, "home_win_rate": rate, "calibrated": calibrated, "note": note})
+    return out
+
+
+def team_snapshot(completed: list[dict]) -> pd.DataFrame:
+    """Wins and points from completed 2026 regular-season games."""
+    totals: dict[str, dict] = {}
+    for row in completed:
+        if row.get("season") != 2026 or row.get("game_type") != "REG":
+            continue
+        for side, other in (("home", "away"), ("away", "home")):
+            bucket = totals.setdefault(
+                row[side],
+                {"team": row[side], "games": 0, "wins": 0, "losses": 0, "points_for": 0, "points_against": 0},
+            )
+            bucket["games"] += 1
+            bucket["points_for"] += int(row[f"{side}_score"])
+            bucket["points_against"] += int(row[f"{other}_score"])
+            if int(row[f"{side}_score"]) > int(row[f"{other}_score"]):
+                bucket["wins"] += 1
+            else:
+                bucket["losses"] += 1
+    frame = pd.DataFrame(totals.values())
+    if frame.empty:
+        return frame
+    frame["ppg"] = frame["points_for"] / frame["games"]
+    frame["papg"] = frame["points_against"] / frame["games"]
+    return frame.sort_values("team")
 
 
 def season_team_stats(log: pd.DataFrame) -> pd.DataFrame:
@@ -525,11 +722,11 @@ def pull_player_stats() -> tuple[int, str]:
         frame.to_csv(PLAYER_STATS_PATH, index=False)
         print(f"player rows {len(frame)} from stats.nba.com")
         return len(frame), "Player totals are the 2026-27 per-game base table from stats.nba.com."
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"stats.nba.com player table failed: {type(exc).__name__}")
     try:
-        payload = fetch_json(PLAYER_ESPN_URL)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        payload = fetch_json(PLAYER_ESPN_URL, attempts=2)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, json.JSONDecodeError) as exc:
         print(f"player leaders failed: {type(exc).__name__}")
         return 0, "Player totals were not available."
     catalogs = {
@@ -569,8 +766,53 @@ def write_table(path: Path, rows: list[dict], columns: list[str]) -> None:
     frame[columns].to_csv(path, index=False)
 
 
+def add_later_espn_finals(completed: list[dict], espn_rows: list[dict]) -> int:
+    """Add ESPN finals dated after the league log. Older mismatches stay out."""
+    if not completed:
+        return 0
+    log_max = max(row["date"] for row in completed)
+    known = {(row["date"], row["away"], row["home"]) for row in completed}
+    added = 0
+    for row in espn_rows:
+        if row["status"] != "STATUS_FINAL" or row["date"] > AS_OF.isoformat() or row["date"] <= log_max:
+            continue
+        if row["away_score"] is None or row["home_score"] is None:
+            continue
+        if row["away_score"] == 0 and row["home_score"] == 0:
+            continue
+        key = (row["date"], row["away"], row["home"])
+        if key in known:
+            continue
+        season = 2026 if row["date"] >= "2026-10-01" else 2025
+        completed.append(
+            {
+                "event_id": f"espn_{row['date']}_{row['away']}_{row['home']}",
+                "date": row["date"],
+                "season": season,
+                "game_type": "REG",
+                "away": row["away"],
+                "home": row["home"],
+                "away_name": row["away_name"],
+                "home_name": row["home_name"],
+                "away_score": row["away_score"],
+                "home_score": row["home_score"],
+                "played": True,
+                "venue": row["venue"],
+            }
+        )
+        known.add(key)
+        added += 1
+    completed.sort(key=lambda item: (item["date"], item.get("event_id", ""), item["away"], item["home"]))
+    return added
+
+
 def main() -> None:
     log, log_notes = load_logs()
+    if log.empty and LOG_PATH.exists():
+        log = pd.read_csv(LOG_PATH)
+        log["GAME_DATE"] = log["GAME_DATE"].astype(str).str.slice(0, 10)
+        log_notes.append("stats.nba.com failed. The saved team game log was loaded.")
+        print(log_notes[-1])
     if log.empty or not ((log["season"] == 2026) & (log["game_type"] == "REG")).any():
         raise SystemExit("stats.nba.com did not return the 2026-27 regular season")
     log = log[log["GAME_DATE"] <= AS_OF.isoformat()].copy()
@@ -580,15 +822,20 @@ def main() -> None:
     teams = team_ids()
     print(f"teams {len(teams)}")
     espn_rows = espn_games(collect_events(teams))
+    added = add_later_espn_finals(completed, espn_rows)
+    if added:
+        log_notes.append(f"ESPN added {added} finals dated after the league log.")
+        print(log_notes[-1])
     comparison = compare_finals(completed, espn_rows)
     attach_venues(completed, espn_rows)
     upcoming = upcoming_games(espn_rows, completed)
     ordered = sorted(completed + upcoming, key=lambda row: (row["date"], row.get("event_id", ""), row["away"], row["home"]))
     add_prior_form(ordered)
-    train_rows = score_rows(completed, upcoming)
+    model_report = choose_model(completed)
+    train_rows = score_rows(completed, upcoming, model_report["use_blend"])
     hold_train, hold_test, accuracy = holdout_accuracy(completed)
     player_rows, player_note = pull_player_stats()
-    team_stats = season_team_stats(log)
+    team_stats = team_snapshot(completed)
     team_stats.to_csv(TEAM_STATS_PATH, index=False)
 
     for row in completed + upcoming:
@@ -628,7 +875,10 @@ def main() -> None:
         "game_id", "date", "season", "game_type", "away", "home", "away_score", "home_score", "home_win",
         *FEATURES, "home_win_prob",
     ]
-    next_columns = completed_columns + ["predicted_away_points", "predicted_home_points", "predicted_points"]
+    next_columns = completed_columns + [
+        "predicted_away_points", "predicted_home_points", "predicted_points", "predicted_total",
+        "pick_side", "pick_team", "confidence", "confidence_tier",
+    ]
     write_table(COMPLETED_PATH, completed, completed_columns)
     write_table(NEXT_PATH, upcoming, next_columns)
     seeds = [
@@ -638,6 +888,11 @@ def main() -> None:
             "home": row["home"],
             "home_win_prob": row.get("home_win_prob"),
             "predicted_points": row.get("predicted_points"),
+            "predicted_total": row.get("predicted_total"),
+            "pick_side": row.get("pick_side"),
+            "pick_team": row.get("pick_team"),
+            "confidence": row.get("confidence"),
+            "confidence_tier": row.get("confidence_tier"),
             "spread_line": "",
             "total_line": "",
             "lean": "",
@@ -648,7 +903,28 @@ def main() -> None:
     write_table(
         SEEDS_PATH,
         seeds,
-        ["date", "away", "home", "home_win_prob", "predicted_points", "spread_line", "total_line", "lean", "line"],
+        [
+            "date", "away", "home", "home_win_prob", "predicted_points", "predicted_total",
+            "pick_side", "pick_team", "confidence", "confidence_tier",
+            "spread_line", "total_line", "lean", "line",
+        ],
+    )
+    scored = [row for row in completed if row.get("home_win") is not None and row.get("home_win_prob") is not None]
+    in_sample = None if not scored else sum(int(float(row["home_win_prob"]) >= 0.5) == int(row["home_win"]) for row in scored) / len(scored)
+    holdout_pairs = [] if model_report.get("chosen") is None else model_report["chosen"]["pairs"]
+    write_table(
+        CALIBRATION_PATH,
+        calibration_rows(completed, "in_sample") + calibration_rows(holdout_pairs, "holdout"),
+        ["split", "bin", "count", "home_win_rate", "calibrated", "note"],
+    )
+    high_rows = [row for row in upcoming if row.get("confidence_tier") == "high"]
+    write_table(
+        HIGH_PATH,
+        high_rows,
+        [
+            "game_id", "date", "away", "home", "home_win_prob", "pick_side", "pick_team",
+            "confidence", "confidence_tier", "predicted_away_points", "predicted_home_points", "predicted_total",
+        ],
     )
     max_date = max(row["date"] for row in completed)
     min_date = min(row["date"] for row in completed)
@@ -665,7 +941,7 @@ def main() -> None:
         "the upcoming schedule and venues. Team abbreviations follow stats.nba.com. "
         "A sportsbook is not called. Refresh is manual. This does not price a bet.\n\n"
         "Run `python scripts/refresh_today.py` during the season. "
-        "The script keeps results through its as-of date, 2026-11-07.\n\n"
+        f"The script keeps results through its as-of date, {AS_OF.isoformat()}.\n\n"
         "Output files use the same seeds columns as nfl_game_predictor: "
         "date, away, home, home_win_prob, predicted_points, spread_line, total_line, lean, line. "
         "spread_line and total_line are blank. The line column says this is not a bet.\n",
@@ -681,10 +957,12 @@ def main() -> None:
         "ESPN marks some postponed games as post with a 0-0 score. Those games are not stored. "
         f"{comparison} The ESPN final dated 2025-12-16, SAS at NYK, 113-124, is not in the league log, so it is not stored. "
         f"{player_note} "
-        "Form uses only earlier games: win rate, points scored, points allowed, and rest days. "
+        "Form uses only earlier games: win rate, points scored, points allowed, rest days, and the last four games "
+        "when that check improves the holdout. "
         "A game does not train on its own score. The published home_win_prob on a completed game is in-sample. "
         "The held-out accuracy below is a separate fit. The win model is a ridge classifier. "
-        "Points use linear regression.\n\n"
+        "Points use linear regression, plus a half-weight of prior points per game only when that blend lowers "
+        "the holdout total error.\n\n"
         "There is no recorded public closing line in this table. spread_line and total_line are blank. "
         "The line column says this is not a bet. This does not price a bet.\n\n"
         "ESPN abbreviations GS, NO, NY, SA, UTAH, and WSH are stored as GSW, NOP, NYK, SAS, UTA, and WAS.\n\n"
@@ -699,6 +977,12 @@ def main() -> None:
         f"Next games through {NEXT_THROUGH.isoformat()}: {len(upcoming)}\n"
         f"Next games with home_win_prob: {scored_next}\n"
         f"Held-out games from {HOLDOUT_START.isoformat()}: {hold_test} of {hold_train} training rows, accuracy {accuracy_text}\n"
+        f"In-sample accuracy: {'not computed' if in_sample is None else f'{in_sample:.4f}'} on {len(scored)} scored rows\n"
+        f"High-confidence next games: {len(high_rows)}\n"
+        f"{card_line('Baseline holdout', model_report.get('baseline'))}\n"
+        f"{card_line('Recent-form holdout', model_report.get('recent'))}\n"
+        f"Recent form adopted: {'yes' if model_report['adopted_recent'] else 'no'}\n"
+        f"Points blend adopted: {'yes' if model_report['use_blend'] else 'no'}\n"
         f"Current-season team rows: {len(team_stats)}\n"
         f"Player rows: {player_rows}\n",
         encoding="utf-8",
@@ -710,6 +994,32 @@ def main() -> None:
     print(f"holdout {hold_train} {hold_test} {accuracy_text}")
     print(f"teams in snapshot {len(team_stats)}")
     print(f"zero scores {zero_scores}")
+    print("recent_form", "yes" if model_report["adopted_recent"] else "no")
+    print("points_blend", "yes" if model_report["use_blend"] else "no")
+    print("features", len(FEATURES))
+    print("high", len(high_rows))
+    log_path = ROOT / "artifacts" / "refresh.log"
+    with log_path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            f"{datetime.now().isoformat(timespec='seconds')} completed {len(completed)} "
+            f"max {max_date} next {len(upcoming)} recent {model_report['adopted_recent']} "
+            f"blend {model_report['use_blend']}\n"
+        )
+    import subprocess
+    import sys
+    result = subprocess.run([sys.executable, str(ROOT / "scripts" / "validate_artifacts.py")], cwd=ROOT, check=False)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
+def card_line(label: str, block: dict | None) -> str:
+    if not block:
+        return f"{label}: not computed"
+    return (
+        f"{label}: accuracy {block['accuracy']:.4f}, total MAE {block['total_mae']:.3f}, "
+        f"prior-points blend MAE {block['blend_mae']:.3f}, "
+        f"{block['test_rows']} test games after {block['train_rows']} earlier games"
+    )
 
 
 if __name__ == "__main__":

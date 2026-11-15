@@ -1,0 +1,9 @@
+split,bin,count,home_win_rate,calibrated,note
+in_sample,50-55,299,0.6120401337792643,yes,observed home-win rate is at least the bin floor
+in_sample,55-60,269,0.6617100371747212,yes,observed home-win rate is at least the bin floor
+in_sample,60-65,188,0.7872340425531915,yes,observed home-win rate is at least the bin floor
+in_sample,65-plus,138,0.8478260869565217,yes,observed home-win rate is at least the bin floor
+holdout,50-55,35,0.6285714285714286,yes,observed home-win rate is at least the bin floor
+holdout,55-60,37,0.6486486486486487,yes,observed home-win rate is at least the bin floor
+holdout,60-65,18,0.5555555555555556,no,count under 20
+holdout,65-plus,30,0.7666666666666667,yes,observed home-win rate is at least the bin floor
