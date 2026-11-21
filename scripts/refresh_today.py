@@ -1,4 +1,4 @@
-"""Pull NBA results and retrain the prior-form table through 2026-11-14.
+"""Pull NBA results and retrain the prior-form table through today.
 
 Completed scores come from stats.nba.com leaguegamefinder. ESPN team
 schedules supply the upcoming schedule and venues. A postponed ESPN game
@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -66,10 +66,10 @@ except ImportError:
             return samples @ self.coef_ + self.intercept_
 
 
-AS_OF = date(2026, 11, 14)
-NEXT_THROUGH = date(2026, 11, 21)
-HOLDOUT_START = date(2026, 10, 20)
 EASTERN = ZoneInfo("America/New_York")
+AS_OF = datetime.now(EASTERN).date()
+NEXT_THROUGH = AS_OF + timedelta(days=7)
+HOLDOUT_START = date(2026, 10, 20)
 ROOT = Path(__file__).resolve().parents[1]
 SCHEDULE_PATH = ROOT / "data" / "schedules" / "games.csv"
 LOG_PATH = ROOT / "data" / "stats_team" / "team_game_log.csv"
@@ -446,7 +446,7 @@ def holdout_accuracy(completed: list[dict]) -> tuple[int, int, float | None]:
     return len(train_rows), len(test_rows), correct / len(test_rows)
 
 
-def score_rows(completed: list[dict], upcoming: list[dict], use_blend: bool = False) -> int:
+def score_rows(completed: list[dict], upcoming: list[dict], points_mode: str = "regression") -> int:
     trainable = [
         row for row in completed
         if row.get("home_win") is not None and all(row.get(feature) is not None for feature in FEATURES)
@@ -454,6 +454,23 @@ def score_rows(completed: list[dict], upcoming: list[dict], use_blend: bool = Fa
     if len(trainable) < 2 or len({row["home_win"] for row in trainable}) < 2:
         return 0
     center, scale, ridge, home_points, away_points, positive_is_home = fit_model(trainable)
+    residual_home = residual_away = None
+    residual_center = residual_scale = None
+    if points_mode == "residual":
+        frame = pd.DataFrame(trainable)
+        matrix = frame[FEATURES].to_numpy(dtype=float)
+        residual_center = matrix.mean(axis=0)
+        residual_scale = matrix.std(axis=0)
+        residual_scale[residual_scale == 0] = 1.0
+        scaled = (matrix - residual_center) / residual_scale
+        residual_home = LinearRegression().fit(
+            scaled,
+            frame["home_score"].to_numpy(dtype=float) - frame["home_ppg"].to_numpy(dtype=float),
+        )
+        residual_away = LinearRegression().fit(
+            scaled,
+            frame["away_score"].to_numpy(dtype=float) - frame["away_ppg"].to_numpy(dtype=float),
+        )
     for row in completed:
         row["home_win_prob"] = win_probability(row, center, scale, ridge, positive_is_home)
     for row in upcoming:
@@ -465,12 +482,21 @@ def score_rows(completed: list[dict], upcoming: list[dict], use_blend: bool = Fa
         sample = ((np.array([row[feature] for feature in FEATURES], dtype=float) - center) / scale).reshape(1, -1)
         home = float(home_points.predict(sample)[0])
         away = float(away_points.predict(sample)[0])
-        if use_blend and row.get("home_ppg") is not None and row.get("away_ppg") is not None:
+        if points_mode == "blend" and row.get("home_ppg") is not None and row.get("away_ppg") is not None:
             regression_total = home + away
             blended_total = 0.5 * regression_total + 0.5 * (float(row["home_ppg"]) + float(row["away_ppg"]))
             margin = home - away
             home = (blended_total + margin) / 2
             away = (blended_total - margin) / 2
+        elif (
+            points_mode == "residual"
+            and residual_home is not None
+            and row.get("home_ppg") is not None
+            and row.get("away_ppg") is not None
+        ):
+            residual_sample = ((np.array([row[feature] for feature in FEATURES], dtype=float) - residual_center) / residual_scale).reshape(1, -1)
+            home = float(row["home_ppg"]) + float(residual_home.predict(residual_sample)[0])
+            away = float(row["away_ppg"]) + float(residual_away.predict(residual_sample)[0])
         row["predicted_home_points"] = home
         row["predicted_away_points"] = away
         row["predicted_points"] = home + away
@@ -527,9 +553,24 @@ def feature_metrics(rows: list[dict], features: list[str], required: list[str]) 
     if len(train_rows) < 2 or not test_rows or len({row["home_win"] for row in train_rows}) < 2:
         return None
     center, scale, ridge, home_points, away_points, positive_is_home = fit_model(train_rows, features)
+    train_frame = pd.DataFrame(train_rows)
+    train_matrix = train_frame[features].to_numpy(dtype=float)
+    residual_center = train_matrix.mean(axis=0)
+    residual_scale = train_matrix.std(axis=0)
+    residual_scale[residual_scale == 0] = 1.0
+    residual_scaled = (train_matrix - residual_center) / residual_scale
+    home_delta = LinearRegression().fit(
+        residual_scaled,
+        train_frame["home_score"].to_numpy(dtype=float) - train_frame["home_ppg"].to_numpy(dtype=float),
+    )
+    away_delta = LinearRegression().fit(
+        residual_scaled,
+        train_frame["away_score"].to_numpy(dtype=float) - train_frame["away_ppg"].to_numpy(dtype=float),
+    )
     correct = 0
     total_error = 0.0
     blend_error = 0.0
+    residual_error = 0.0
     pairs = []
     for row in test_rows:
         probability = win_probability(row, center, scale, ridge, positive_is_home, features)
@@ -541,6 +582,12 @@ def feature_metrics(rows: list[dict], features: list[str], required: list[str]) 
         actual = float(row["home_score"]) + float(row["away_score"])
         total_error += abs((home + away) - actual)
         blend_error += abs((0.5 * (home + away) + 0.5 * (float(row["home_ppg"]) + float(row["away_ppg"]))) - actual)
+        residual_sample = ((np.array([row[name] for name in features], dtype=float) - residual_center) / residual_scale).reshape(1, -1)
+        residual_total = (
+            float(row["home_ppg"]) + float(home_delta.predict(residual_sample)[0])
+            + float(row["away_ppg"]) + float(away_delta.predict(residual_sample)[0])
+        )
+        residual_error += abs(residual_total - actual)
         correct += int(int(probability >= 0.5) == int(row["home_win"]))
         pairs.append({"home_win": int(row["home_win"]), "home_win_prob": probability})
     counted = len(pairs)
@@ -552,6 +599,7 @@ def feature_metrics(rows: list[dict], features: list[str], required: list[str]) 
         "accuracy": correct / counted,
         "total_mae": total_error / counted,
         "blend_mae": blend_error / counted,
+        "residual_mae": residual_error / counted,
         "pairs": pairs,
     }
 
@@ -576,11 +624,20 @@ def choose_model(completed: list[dict]) -> dict:
             adopted = True
     FEATURES = expanded if adopted else base
     active = candidate if adopted else baseline
+    points_mode = "regression"
+    if active is not None:
+        options = [("regression", active["total_mae"]), ("blend", active["blend_mae"])]
+        if active.get("residual_mae") is not None:
+            options.append(("residual", active["residual_mae"]))
+        name, value = min(options, key=lambda item: (item[1], item[0]))
+        if name != "regression" and value + 0.05 < active["total_mae"]:
+            points_mode = name
     return {
         "baseline": baseline,
         "recent": candidate,
         "adopted_recent": adopted,
-        "use_blend": active is not None and active["blend_mae"] + 0.05 < active["total_mae"],
+        "use_blend": points_mode == "blend",
+        "points_mode": points_mode,
         "chosen": active,
     }
 
@@ -969,6 +1026,7 @@ def add_later_espn_finals(completed: list[dict], espn_rows: list[dict]) -> int:
 
 
 def main() -> None:
+    print(f"as_of {AS_OF.isoformat()} next_through {NEXT_THROUGH.isoformat()}", flush=True)
     log, log_notes = load_logs()
     if log.empty and LOG_PATH.exists():
         log = pd.read_csv(LOG_PATH)
@@ -994,7 +1052,7 @@ def main() -> None:
     ordered = sorted(completed + upcoming, key=lambda row: (row["date"], row.get("event_id", ""), row["away"], row["home"]))
     add_prior_form(ordered)
     model_report = choose_model(completed)
-    train_rows = score_rows(completed, upcoming, model_report["use_blend"])
+    train_rows = score_rows(completed, upcoming, model_report["points_mode"])
     hold_train, hold_test, accuracy = holdout_accuracy(completed)
     player_rows, player_note = pull_player_stats()
     team_stats, team_note = write_team_counting(completed)
@@ -1122,8 +1180,9 @@ def main() -> None:
         "when that check improves the holdout. "
         "A game does not train on its own score. The published home_win_prob on a completed game is in-sample. "
         "The held-out accuracy below is a separate fit. The win model is a ridge classifier. "
-        "Points use linear regression, plus a half-weight of prior points per game only when that blend lowers "
-        "the holdout total error.\n\n"
+        "Points use linear regression. A half-weight of prior points per game, or a residual on top of prior "
+        "points per game, is used only when that choice lowers the holdout total error. "
+        "Opponent win rate is the other side's prior win rate.\n\n"
         "There is no recorded public closing line in this table. spread_line and total_line are blank. "
         "The line column says this is not a bet. This does not price a bet.\n\n"
         "ESPN abbreviations GS, NO, NY, SA, UTAH, and WSH are stored as GSW, NOP, NYK, SAS, UTA, and WAS.\n\n"
@@ -1144,6 +1203,7 @@ def main() -> None:
         f"{card_line('Recent-form holdout', model_report.get('recent'))}\n"
         f"Recent form adopted: {'yes' if model_report['adopted_recent'] else 'no'}\n"
         f"Points blend adopted: {'yes' if model_report['use_blend'] else 'no'}\n"
+        f"Points method: {model_report['points_mode']}\n"
         f"Current-season team rows: {len(team_stats)}. {team_note}\n"
         f"Player rows: {player_rows}\n",
         encoding="utf-8",
@@ -1157,6 +1217,7 @@ def main() -> None:
     print(f"zero scores {zero_scores}")
     print("recent_form", "yes" if model_report["adopted_recent"] else "no")
     print("points_blend", "yes" if model_report["use_blend"] else "no")
+    print("points_method", model_report["points_mode"])
     print("features", len(FEATURES))
     print("high", len(high_rows))
     log_path = ROOT / "artifacts" / "refresh.log"
@@ -1164,7 +1225,7 @@ def main() -> None:
         handle.write(
             f"{datetime.now().isoformat(timespec='seconds')} completed {len(completed)} "
             f"max {max_date} next {len(upcoming)} recent {model_report['adopted_recent']} "
-            f"blend {model_report['use_blend']}\n"
+            f"blend {model_report['use_blend']} points {model_report['points_mode']}\n"
         )
     import subprocess
     import sys
@@ -1179,6 +1240,7 @@ def card_line(label: str, block: dict | None) -> str:
     return (
         f"{label}: accuracy {block['accuracy']:.4f}, total MAE {block['total_mae']:.3f}, "
         f"prior-points blend MAE {block['blend_mae']:.3f}, "
+        f"residual MAE {block.get('residual_mae', 0):.3f}, "
         f"{block['test_rows']} test games after {block['train_rows']} earlier games"
     )
 
